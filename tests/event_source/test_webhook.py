@@ -12,6 +12,53 @@ import pytest
 from ansible_rulebook.event_source.webhook import main as webhook_main
 
 
+async def wait_for_server(
+    host: str,
+    port: int,
+    timeout: float = 5.0,
+    check_interval: float = 0.1,
+    use_ssl: bool = False,
+) -> None:
+    """Wait for the webhook server to be ready to accept connections.
+
+    Args:
+        host: Server hostname
+        port: Server port
+        timeout: Maximum time to wait in seconds
+        check_interval: Time between connection attempts in seconds
+        use_ssl: Whether to use SSL/TLS connection
+
+    Raises:
+        TimeoutError: If server is not ready within timeout period
+    """
+    start_time = asyncio.get_event_loop().time()
+
+    while True:
+        try:
+            # Try to establish a TCP connection to check if server is listening
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=0.5
+            )
+            writer.close()
+            await writer.wait_closed()
+            # Server is accepting connections
+            return
+        except (OSError, asyncio.TimeoutError):
+            # Server not ready yet
+            pass
+
+        elapsed = asyncio.get_event_loop().time() - start_time
+        if elapsed >= timeout:
+            scheme = "https" if use_ssl else "http"
+            raise TimeoutError(
+                f"Server at {scheme}://{host}:{port} did not become ready "
+                f"within {timeout}s"
+            )
+
+        await asyncio.sleep(check_interval)
+
+
 @pytest.fixture(scope="session")
 def dynamic_certs(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
     sscg = shutil.which("sscg")
@@ -100,11 +147,15 @@ async def test_cancel() -> None:
 
     args = {"host": "localhost", "port": 8000, "token": "secret"}
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
-    cancel_task = asyncio.create_task(cancel_code(plugin_task))
+    await wait_for_server(args["host"], args["port"])
+    plugin_task.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.gather(plugin_task, cancel_task)
+    # The webhook server catches CancelledError and exits gracefully
+    # So we just await the task to ensure it completes without error
+    await plugin_task
+    assert plugin_task.done()
+    # It handled the cancellation gracefully
+    assert not plugin_task.cancelled()
 
 
 @pytest.mark.asyncio
@@ -120,7 +171,7 @@ async def test_post_endpoint(dynamic_certs: pathlib.Path) -> None:
         "cafile": str(dynamic_certs / "ca.crt"),
     }
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"], use_ssl=True)
 
     task_info = {
         "payload": {"src_path": "https://example.com/payload"},
@@ -153,7 +204,7 @@ async def test_post_unsupported_body() -> None:
                 assert resp.status == HTTPStatus.BAD_REQUEST
 
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"])
     request_task = asyncio.create_task(do_request())
     await asyncio.gather(plugin_task, request_task)
 
@@ -172,7 +223,7 @@ async def test_post_hmac_hex_endpoint() -> None:
     }
 
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"])
 
     task_info = {
         "payload": {"src_path": "https://example.com/payload"},
@@ -209,7 +260,7 @@ async def test_post_hmac_hex_wo_digest_prefix_endpoint() -> None:
     }
 
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"])
 
     task_info = {
         "payload": {"src_path": "https://example.com/payload"},
@@ -246,7 +297,7 @@ async def test_post_hmac_hex_endpoint_invalid_signature() -> None:
     }
 
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"])
 
     task_info = {
         "payload": {"src_path": "https://example.com/payload"},
@@ -280,7 +331,7 @@ async def test_post_hmac_hex_endpoint_missing_signature() -> None:
     }
 
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"])
 
     task_info = {
         "payload": {"src_path": "https://example.com/payload"},
@@ -314,7 +365,7 @@ async def test_post_hmac_base64_endpoint() -> None:
     }
 
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"])
 
     task_info = {
         "payload": {"src_path": "https://example.com/payload"},
@@ -348,7 +399,7 @@ async def test_post_hmac_base64_endpoint_invalid_signature() -> None:
     }
 
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"])
 
     task_info = {
         "payload": {"src_path": "https://example.com/payload"},
@@ -377,7 +428,7 @@ async def test_post_token_and_hmac_hex_endpoint() -> None:
     }
 
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"])
 
     task_info = {
         "payload": {"src_path": "https://example.com/payload"},
@@ -413,7 +464,7 @@ async def test_post_token_and_hmac_hex_endpoint_invalid_signature() -> None:
     }
 
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"])
 
     task_info = {
         "payload": {"src_path": "https://example.com/payload"},
@@ -449,7 +500,7 @@ async def test_post_token_and_hmac_hex_endpoint_invalid_token() -> None:
     }
 
     plugin_task = asyncio.create_task(start_server(queue, args))
-    await asyncio.sleep(0.1)
+    await wait_for_server(args["host"], args["port"])
 
     task_info = {
         "payload": {"src_path": "https://example.com/payload"},
