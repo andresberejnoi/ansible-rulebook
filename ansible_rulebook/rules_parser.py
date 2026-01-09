@@ -17,6 +17,16 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import ansible_rulebook.rule_types as rt
+from ansible_rulebook.collection import (
+    EVENT_SOURCE_FILTER_OBJ_TYPE,
+    EVENT_SOURCE_OBJ_TYPE,
+    get_deprecation_info,
+    get_redirect_info,
+    get_tombstone_info,
+    load_plugin_routing,
+    log_deprecation_warning,
+    split_collection_name,
+)
 from ansible_rulebook.condition_parser import (
     parse_condition as parse_condition_value,
 )
@@ -28,6 +38,8 @@ from .exception import (
     RulenameEmptyException,
     RulesetNameDuplicateException,
     RulesetNameEmptyException,
+    SourceFilterNotFoundException,
+    SourcePluginNotFoundException,
 )
 
 LEGACY_FILTER_MAPPING = {
@@ -45,7 +57,6 @@ LEGACY_SOURCE_MAPPING = {
     "ansible.eda.generic": "eda.builtin.generic",
     "ansible.eda.range": "eda.builtin.range",
 }
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -111,6 +122,106 @@ def parse_rule_sets(
     return rule_set_list
 
 
+def _apply_plugin_routing(
+    plugin_name: str,
+    obj_type: str,
+    legacy_mapping: Dict,
+    tombstone_exception: type,
+) -> str:
+    """Apply plugin routing (legacy, deprecation, tombstone, redirect).
+
+    Follows ansible-core behavior:
+    - Applies legacy mappings first
+    - Follows redirect chains (not just single redirects)
+    - Checks deprecation before tombstone for each plugin in chain
+    - Detects redirect loops
+
+    Args:
+        plugin_name: The plugin name (source or filter)
+        obj_type: Type of plugin ('event_source' or 'event_filter')
+        legacy_mapping: Legacy mapping dict for this plugin type
+        tombstone_exception: Exception to raise if tombstoned
+
+    Returns:
+        The final plugin name after applying routing rules
+
+    Raises:
+        tombstone_exception: If plugin is tombstoned
+        ValueError: If redirect loop detected
+    """
+    # Check legacy mapping first
+    if plugin_name in legacy_mapping:
+        LOGGER.info(
+            f"redirecting (type: {obj_type}) "
+            f"{plugin_name} to {legacy_mapping[plugin_name]}"
+        )
+        return legacy_mapping[plugin_name]
+
+    # Track redirect path to detect loops
+    MAX_REDIRECT_CHAIN_LEN = 10
+    redirect_chain = [plugin_name]
+    current_name = plugin_name
+
+    # Follow redirect chain
+    jump_count = 0
+    while jump_count < MAX_REDIRECT_CHAIN_LEN:
+        # Load runtime plugin routing for current plugin
+        plugin_routing = load_plugin_routing(current_name)
+        if not plugin_routing:
+            return current_name
+
+        _, simple_plugin_name = split_collection_name(current_name)
+
+        # First: Check deprecation
+        deprecation_data = get_deprecation_info(
+            plugin_routing, obj_type, simple_plugin_name
+        )
+        if deprecation_data:
+            log_deprecation_warning(current_name, obj_type, deprecation_data)
+
+        # Second: Check tombstone - if tombstoned, fail immediately
+        tombstone_data = get_tombstone_info(
+            plugin_routing, obj_type, simple_plugin_name
+        )
+        if tombstone_data:
+            error_msg = (
+                f"The {current_name} {obj_type} has been removed. "
+                f"{tombstone_data.get('warning_text', '')}"
+            )
+            raise tombstone_exception(current_name, message=error_msg)
+
+        # Third: Check for redirect
+        redirect = get_redirect_info(
+            plugin_routing, obj_type, simple_plugin_name
+        )
+        if redirect:
+            # Check for redirect loop
+            if redirect in redirect_chain:
+                raise ValueError(
+                    f"plugin redirect loop resolving {plugin_name} "
+                    f"(path: {redirect_chain + [redirect]})"
+                )
+
+            LOGGER.info(
+                f"redirecting (type: {obj_type}) "
+                f"{current_name} to {redirect}"
+            )
+            redirect_chain.append(redirect)
+            current_name = redirect
+        else:
+            return current_name
+
+        jump_count += 1
+
+    # This is raised when the while condition is no longer True
+    else:
+        error_msg = (
+            f"Exceeded max allowed ({MAX_REDIRECT_CHAIN_LEN}) redirections"
+        )
+        # RuntimeError seems ok here, but maybe we need a different exception
+        raise RuntimeError(error_msg)
+
+
 def parse_event_sources(sources: Dict) -> List[rt.EventSource]:
     source_list = []
     for source in sources:
@@ -124,17 +235,12 @@ def parse_event_sources(sources: Dict) -> List[rt.EventSource]:
         else:
             source_args = {}
 
-        # Swap out sources for our builtins if available
-        if source_name in LEGACY_SOURCE_MAPPING:
-            LOGGER.info(
-                (
-                    "Source %s has been deprecated, "
-                    "please update your rulebook to use: %s"
-                ),
-                source_name,
-                LEGACY_SOURCE_MAPPING[source_name],
-            )
-            source_name = LEGACY_SOURCE_MAPPING[source_name]
+        source_name = _apply_plugin_routing(
+            source_name,
+            EVENT_SOURCE_OBJ_TYPE,
+            LEGACY_SOURCE_MAPPING,
+            SourcePluginNotFoundException,
+        )
 
         source_list.append(
             rt.EventSource(
@@ -153,16 +259,13 @@ def parse_source_filter(source_filter: Dict) -> rt.EventSourceFilter:
     source_filter_name = list(source_filter.keys())[0]
     source_filter_args = source_filter[source_filter_name]
 
-    if source_filter_name in LEGACY_FILTER_MAPPING:
-        LOGGER.info(
-            (
-                "Filter  %s has been deprecated, "
-                "please update your rulebook to use: %s"
-            ),
-            source_filter_name,
-            LEGACY_FILTER_MAPPING[source_filter_name],
-        )
-        source_filter_name = LEGACY_FILTER_MAPPING[source_filter_name]
+    source_filter_name = _apply_plugin_routing(
+        source_filter_name,
+        EVENT_SOURCE_FILTER_OBJ_TYPE,
+        LEGACY_FILTER_MAPPING,
+        SourceFilterNotFoundException,
+    )
+
     return rt.EventSourceFilter(source_filter_name, source_filter_args)
 
 
